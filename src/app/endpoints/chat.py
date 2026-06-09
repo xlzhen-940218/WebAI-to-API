@@ -130,74 +130,96 @@ async def responses_api(raw_request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # 1. 将 Responses 协议中的 input 转换为内部兼容的 messages
+    # 1. 转换请求结构
     if "input" in payload:
         payload["messages"] = payload.pop("input")
     
-    # 2. 修复数据结构差异：Codex 使用 "input_text"，而 OpenAI 规范使用 "text"
+    # 2. 修复数据结构差异：将 input_text 映射为 text
     for msg in payload.get("messages", []):
         if isinstance(msg.get("content"), list):
             for part in msg["content"]:
-                if isinstance(part, dict):
-                    # 将 input_text 映射为 text
-                    if part.get("type") == "input_text":
-                        part["type"] = "text"
-                    # 如果后续 Codex 传文件/图片报错，也可以在这里添加映射规则，例如：
-                    # elif part.get("type") == "input_image": ...
+                if isinstance(part, dict) and part.get("type") == "input_text":
+                    part["type"] = "text"
 
-    # 移除可能引起 Pydantic 校验错误的特有参数
     payload.pop("context_management", None)
 
     try:
-        # 使用转换后的 payload 实例化标准的 OpenAIChatRequest
         chat_req = OpenAIChatRequest(**payload)
     except Exception as e:
-        # 如果再次报错，错误信息会在这里被捕获
         raise HTTPException(status_code=400, detail=f"Request parsing error: {e}")
 
-    # 附加 http_request_id (与原 chat_completions 保持一致)
     if hasattr(raw_request.state, "request_id"):
         object.__setattr__(chat_req, "_http_request_id", raw_request.state.request_id)
 
-    # 解析 provider
     provider, resolved_model = ProviderFactory.get_provider(chat_req)
     chat_req.model = resolved_model
 
-    # 3. 获取 Provider 的标准响应
+    # 3. 获取标准响应
     original_response = await provider.chat_completions(chat_req)
 
-    # 4. 拦截并转换流式输出
+    # 4. 拦截并转换流式输出 (修复 response.completed 问题)
     if isinstance(original_response, StreamingResponse):
         async def response_stream_generator():
             buffer = ""
+            last_id = "resp-123"
+            completed_sent = False  # 状态标记：是否已发送过 completed 信号
+            
             async for chunk in original_response.body_iterator:
                 if isinstance(chunk, bytes):
                     buffer += chunk.decode("utf-8")
                 else:
                     buffer += chunk
                 
-                # 按行处理 SSE 数据
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     if line.startswith("data: "):
                         data_str = line[6:]
+                        
+                        # 处理流结束标志
                         if data_str.strip() == "[DONE]":
+                            # 如果上游直接发了 [DONE] 但我们还没发送 completed，在这里补发
+                            if not completed_sent:
+                                completed_chunk = {"id": last_id, "object": "response.completed"}
+                                yield f"data: {json.dumps(completed_chunk)}\n\n"
+                                completed_sent = True
+                                
                             yield "data: [DONE]\n\n"
                             continue
                         
                         try:
                             data_json = json.loads(data_str)
-                            # 提取 delta 重新封装为 output
+                            last_id = data_json.get("id", last_id)
+                            
                             if "choices" in data_json and len(data_json["choices"]) > 0:
-                                delta = data_json["choices"][0].get("delta", {})
+                                choice = data_json["choices"][0]
+                                delta = choice.get("delta", {})
+                                
+                                # 发送常规的内容块 (response.chunk)
                                 response_chunk = {
-                                    "id": data_json.get("id", "resp-id"),
+                                    "id": last_id,
                                     "object": "response.chunk",
                                     "output": [delta]
                                 }
                                 yield f"data: {json.dumps(response_chunk)}\n\n"
+                                
+                                # 核心修复：一旦检测到上游给出 finish_reason，立刻下发 response.completed
+                                if choice.get("finish_reason") is not None:
+                                    if not completed_sent:
+                                        completed_chunk = {
+                                            "id": last_id, 
+                                            "object": "response.completed"
+                                        }
+                                        yield f"data: {json.dumps(completed_chunk)}\n\n"
+                                        completed_sent = True
+                                        
                         except json.JSONDecodeError:
                             continue
+            
+            # 安全兜底：如果底层流意外中断（没发 [DONE] 也没有 finish_reason），保证客户端能收到结束信号
+            if not completed_sent:
+                completed_chunk = {"id": last_id, "object": "response.completed"}
+                yield f"data: {json.dumps(completed_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
                             
         return StreamingResponse(response_stream_generator(), media_type="text/event-stream")
     
