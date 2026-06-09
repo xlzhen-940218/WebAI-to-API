@@ -134,6 +134,17 @@ async def responses_api(raw_request: Request):
     if "input" in payload:
         payload["messages"] = payload.pop("input")
     
+    # 2. 修复数据结构差异：Codex 使用 "input_text"，而 OpenAI 规范使用 "text"
+    for msg in payload.get("messages", []):
+        if isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict):
+                    # 将 input_text 映射为 text
+                    if part.get("type") == "input_text":
+                        part["type"] = "text"
+                    # 如果后续 Codex 传文件/图片报错，也可以在这里添加映射规则，例如：
+                    # elif part.get("type") == "input_image": ...
+
     # 移除可能引起 Pydantic 校验错误的特有参数
     payload.pop("context_management", None)
 
@@ -141,6 +152,7 @@ async def responses_api(raw_request: Request):
         # 使用转换后的 payload 实例化标准的 OpenAIChatRequest
         chat_req = OpenAIChatRequest(**payload)
     except Exception as e:
+        # 如果再次报错，错误信息会在这里被捕获
         raise HTTPException(status_code=400, detail=f"Request parsing error: {e}")
 
     # 附加 http_request_id (与原 chat_completions 保持一致)
@@ -151,10 +163,10 @@ async def responses_api(raw_request: Request):
     provider, resolved_model = ProviderFactory.get_provider(chat_req)
     chat_req.model = resolved_model
 
-    # 2. 获取 Provider 的标准响应
+    # 3. 获取 Provider 的标准响应
     original_response = await provider.chat_completions(chat_req)
 
-    # 3. 拦截并转换流式输出
+    # 4. 拦截并转换流式输出
     if isinstance(original_response, StreamingResponse):
         async def response_stream_generator():
             buffer = ""
@@ -189,7 +201,7 @@ async def responses_api(raw_request: Request):
                             
         return StreamingResponse(response_stream_generator(), media_type="text/event-stream")
     
-    # 4. 拦截并转换非流式输出
+    # 5. 拦截并转换非流式输出
     else:
         if hasattr(original_response, "model_dump"):
             data = original_response.model_dump()
