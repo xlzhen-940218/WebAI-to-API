@@ -81,6 +81,7 @@ def print_server_info(host: str, port: int, mode: str):
         except Exception:
             print("  - Could not load config details.")
         print("\n🔗 Primary APIs:")
+        print(f"  - POST {base_url}/v1/responses")
         print(f"  - POST {base_url}/v1/chat/completions")
         print(f"  - POST {base_url}/translate")
         print(f"  - POST {base_url}/v1beta/models/{{model_path:path}}")

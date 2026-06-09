@@ -25,6 +25,10 @@ CATEGORY_MAPPING = {
 }
 
 FEATURE_REGISTRY = {
+    "/v1/responses": {
+        "streaming": True,
+        "persistence": "provider-dependent",
+    },
     "/v1/chat/completions": {
         "streaming": True,
         "persistence": "provider-dependent",

@@ -1,5 +1,7 @@
 # src/app/endpoints/chat.py
+import json
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from app.logger import logger
 from app.openapi.chat_completions import (
     CHAT_COMPLETIONS_REQUEST_EXAMPLES,
@@ -74,6 +76,8 @@ async def translate_chat(request: GeminiRequest):
     except Exception as e:
         logger.error(f"Error in /translate endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error during translation: {str(e)}")
+
+
 @router.post(
     "/v1/temporary/chat/completions",
     tags=["Chat"],
@@ -112,6 +116,94 @@ async def temporary_chat_completions(request: OpenAIChatRequest):
 )
 async def get_models():
     return await build_model_catalog(include_legacy_playwright_aliases=False, allow_stale=False)
+
+
+@router.post(
+    "/v1/responses",
+    tags=["Chat"],
+    summary="Codex Responses API Compatibility",
+    description="Endpoint to support the newer /v1/responses protocol used by Codex by seamlessly translating it to internal /v1/chat/completions logic."
+)
+async def responses_api(raw_request: Request):
+    try:
+        payload = await raw_request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # 1. 将 Responses 协议中的 input 转换为内部兼容的 messages
+    if "input" in payload:
+        payload["messages"] = payload.pop("input")
+    
+    # 移除可能引起 Pydantic 校验错误的特有参数
+    payload.pop("context_management", None)
+
+    try:
+        # 使用转换后的 payload 实例化标准的 OpenAIChatRequest
+        chat_req = OpenAIChatRequest(**payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Request parsing error: {e}")
+
+    # 附加 http_request_id (与原 chat_completions 保持一致)
+    if hasattr(raw_request.state, "request_id"):
+        object.__setattr__(chat_req, "_http_request_id", raw_request.state.request_id)
+
+    # 解析 provider
+    provider, resolved_model = ProviderFactory.get_provider(chat_req)
+    chat_req.model = resolved_model
+
+    # 2. 获取 Provider 的标准响应
+    original_response = await provider.chat_completions(chat_req)
+
+    # 3. 拦截并转换流式输出
+    if isinstance(original_response, StreamingResponse):
+        async def response_stream_generator():
+            buffer = ""
+            async for chunk in original_response.body_iterator:
+                if isinstance(chunk, bytes):
+                    buffer += chunk.decode("utf-8")
+                else:
+                    buffer += chunk
+                
+                # 按行处理 SSE 数据
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            continue
+                        
+                        try:
+                            data_json = json.loads(data_str)
+                            # 提取 delta 重新封装为 output
+                            if "choices" in data_json and len(data_json["choices"]) > 0:
+                                delta = data_json["choices"][0].get("delta", {})
+                                response_chunk = {
+                                    "id": data_json.get("id", "resp-id"),
+                                    "object": "response.chunk",
+                                    "output": [delta]
+                                }
+                                yield f"data: {json.dumps(response_chunk)}\n\n"
+                        except json.JSONDecodeError:
+                            continue
+                            
+        return StreamingResponse(response_stream_generator(), media_type="text/event-stream")
+    
+    # 4. 拦截并转换非流式输出
+    else:
+        if hasattr(original_response, "model_dump"):
+            data = original_response.model_dump()
+        elif hasattr(original_response, "dict"):
+            data = original_response.dict()
+        else:
+            data = original_response
+
+        response_data = {
+            "id": data.get("id", "resp-123"),
+            "object": "response",
+            "output": [choice["message"] for choice in data.get("choices", [])]
+        }
+        return response_data
 
 
 @router.post(
